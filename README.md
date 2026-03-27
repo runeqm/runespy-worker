@@ -135,8 +135,6 @@ docker run -d \
   runespy-worker
 ```
 
-The `< file` stdin redirect works on both Linux and macOS. The container decodes with `base64 -d`, which tolerates line-wrapped output from either platform.
-
 `--restart unless-stopped` means the container restarts automatically after a crash or after the Docker daemon restarts (e.g. following a reboot). For this to work across reboots, Docker itself must start on login:
 
 - **Linux**: `sudo systemctl enable docker` (often already enabled)
