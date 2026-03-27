@@ -1,4 +1,40 @@
-"""RuneMetrics profile fetcher — standalone copy for the worker client."""
+"""RuneMetrics profile fetcher with hiscores fallback.
+
+Primary source — RuneMetrics API
+---------------------------------
+``fetch_profile`` hits ``https://apps.runescape.com/runemetrics/profile/profile``
+and returns the JSON blob directly.  The API returns ``{"error": "..."}`` for
+private profiles and several other edge cases; the error message is compared
+case-insensitively against ``_PRIVATE_ERRORS`` to distinguish a private profile
+(``PROFILE_PRIVATE``) from a genuine API failure (``API_ERROR``).
+
+Fallback — hiscores lite CSV
+------------------------------
+When RuneMetrics reports ``PROFILE_PRIVATE``, ``fetch_hiscores`` is tried.
+Some players who hide their RuneMetrics profile still appear on the public
+hiscores, providing at least their skill levels and XP.
+
+The hiscores lite endpoint returns a plain-text CSV with one row per tracked
+skill, plus an overall totals row prepended:
+
+    Row 0   — Overall totals (rank, total_level, total_xp).  Stored separately;
+              NOT added to ``skillvalues``.
+    Row 1   — Skill 0 (Attack).  Becomes ``{"id": 0, ...}``.
+    Row 2   — Skill 1 (Defence).  Becomes ``{"id": 1, ...}``.
+    ...
+    Row 29  — Skill 28 (Invention).  Becomes ``{"id": 28, ...}``.
+
+RS3 tracks 29 skills (rows 1-29).  Only the first ``n_skills + 1`` rows are
+parsed; activity rows that follow are ignored.
+
+XP unit difference: the hiscores API returns XP values already divided by 10
+(truncated to the nearest 0.1 XP).  To align with the RuneMetrics format (which
+uses tenths of XP), every ``xp`` value is multiplied by 10 before being stored.
+
+The synthesised result dict sets ``"_source": "hiscores"`` so the server can
+distinguish it from a full RuneMetrics response and apply appropriate validation
+rules (e.g. no ``activities`` field is present).
+"""
 
 import httpx
 
@@ -14,7 +50,18 @@ async def fetch_profile(
 ) -> tuple[dict | None, str | None]:
     """Fetch a player profile from the RuneMetrics API.
 
-    Returns (data, error) — exactly one will be non-None.
+    Returns ``(data, None)`` on success or ``(None, error_code)`` on failure.
+    Exactly one element of the tuple is non-None.
+
+    Error codes:
+      ``PROFILE_PRIVATE`` — API returned a privacy error; caller should try
+                            ``fetch_hiscores`` as a fallback.
+      ``RATE_LIMITED``    — HTTP 429; caller should back off.
+      ``TIMEOUT``         — request timed out after 15 s.
+      ``API_ERROR``       — any other HTTP or parsing error.
+
+    The ``+`` → ``" "`` substitution in *username* is needed because RuneScape
+    usernames can contain spaces, which are sometimes stored URL-encoded.
     """
     url = "https://apps.runescape.com/runemetrics/profile/profile"
     api_user = username.replace("+", " ")
@@ -46,7 +93,25 @@ async def fetch_profile(
 async def fetch_hiscores(
     client: httpx.AsyncClient, username: str,
 ) -> tuple[dict | None, str | None]:
-    """Fallback: fetch basic skill data from the hiscores lite API."""
+    """Fetch basic skill data from the hiscores lite CSV endpoint.
+
+    Used as a fallback when RuneMetrics reports ``PROFILE_PRIVATE``.  Some
+    players who hide their RuneMetrics data are still visible on the hiscores.
+
+    Returns ``(data, None)`` on success or ``(None, "API_ERROR")`` on failure.
+    The returned ``data`` dict is shaped to match the RuneMetrics schema as
+    closely as possible:
+
+    - ``skillvalues`` — list of 29 dicts with ``id``, ``level``, ``xp`` (×10),
+      and ``rank``.  Row 0 of the CSV is the overall totals row; it is stored
+      as ``totalskill`` / ``totalxp`` and excluded from the per-skill list.
+    - ``activities`` — always ``[]`` (hiscores provides no activity feed).
+    - ``_source`` — set to ``"hiscores"`` so the server can apply appropriate
+      validation rules for this reduced data set.
+
+    HTML responses (redirects to a login/error page) are rejected so the caller
+    always gets a clean ``API_ERROR`` rather than a parse exception.
+    """
     api_user = username.replace("+", " ")
     url = f"https://secure.runescape.com/m=hiscore/index_lite.ws?player={api_user}"
     try:

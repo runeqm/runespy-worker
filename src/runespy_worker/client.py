@@ -1,4 +1,42 @@
-"""WebSocket client — connects to master, handles tasks."""
+"""WebSocket client — connects to master, authenticates, and processes task batches.
+
+Concurrency model
+-----------------
+All fetch tasks run concurrently, bounded by two independent controls:
+
+  * ``asyncio.Semaphore(max_concurrent)`` — hard cap on the number of tasks
+    that can be in-flight at once (default 5, overridable by the server via
+    ``config`` messages).
+
+  * ``RateLimiter`` — token-bucket that enforces the per-hour request cap
+    assigned by the server at authentication time.  Tokens refill continuously;
+    a task blocks (awaits) until a token is available rather than being dropped.
+
+Results are not sent immediately.  Instead every ``process_task`` call puts its
+result dict into a shared ``asyncio.Queue``; a dedicated ``batch_sender_loop``
+coroutine drains the queue and ships ``batch_result`` messages every
+``BATCH_FLUSH_INTERVAL`` seconds (or immediately when the queue reaches
+``BATCH_MAX_SIZE`` items).  This reduces WebSocket traffic and batching overhead
+on the server.
+
+Connection lifecycle
+--------------------
+``run()`` wraps everything in an outer ``while True`` retry loop so that
+transient network failures cause a reconnect rather than a crash.  On each
+fresh connection the full handshake is repeated:
+
+  1. Receive ``challenge`` (random hex nonce from server).
+  2. Sign nonce with Ed25519 private key (proves worker identity).
+  3. Compute HMAC-SHA256 of nonce with shared secret (proves secret possession).
+  4. Send ``auth`` envelope containing both proofs.
+  5. Receive ``config`` (per-worker fetch parameters) or ``error`` (auth failure).
+  6. Send ``ready`` (advertise concurrency capacity to the dispatcher).
+  7. Enter message dispatch loop: ``assign_batch`` → spawn tasks,
+     ``config`` → update limits live, ``shutdown`` → clean exit.
+
+Background tasks (``heartbeat_loop``, ``batch_sender_loop``) are created after
+authentication and cancelled on disconnect so they do not outlive the WebSocket.
+"""
 
 import asyncio
 import json
@@ -26,7 +64,15 @@ BATCH_MAX_SIZE = 20         # send early if this many results are queued
 
 
 class RateLimiter:
-    """Token bucket rate limiter — shared across all concurrent tasks."""
+    """Token-bucket rate limiter shared across all concurrent fetch tasks.
+
+    Tokens refill continuously at ``rate / period`` tokens per second up to a
+    maximum of ``rate``.  ``acquire()`` blocks until a token is available rather
+    than raising an exception, so callers never need to handle rejection.
+
+    A single lock serialises token accounting so concurrent tasks cannot
+    simultaneously read a non-zero balance and each decrement it.
+    """
 
     def __init__(self, rate: float, period: float = 3600.0):
         """
@@ -69,7 +115,12 @@ _stats = {"completed": 0, "failed": 0}
 
 
 async def heartbeat_loop(ws, worker_id: str, secret: bytes, interval: float = 30.0):
-    """Send periodic heartbeats."""
+    """Send a signed ``heartbeat`` message to the server every *interval* seconds.
+
+    The heartbeat carries cumulative task counters and the current uptime so the
+    server can detect stalled workers.  The loop exits silently on any send
+    error (the outer connection loop handles reconnection).
+    """
     start = time.time()
 
     while True:
@@ -93,7 +144,13 @@ async def batch_sender_loop(
     worker_id: str,
     secret: bytes,
 ):
-    """Drain the result queue and send batch_result messages to the server."""
+    """Drain the result queue and send ``batch_result`` messages to the server.
+
+    Wakes every ``BATCH_FLUSH_INTERVAL`` seconds and collects up to
+    ``BATCH_MAX_SIZE`` items from *result_queue*.  If the send fails (e.g.
+    connection dropped), all dequeued items are re-queued so they are not lost
+    and the loop exits to let the outer connection loop reconnect.
+    """
     while True:
         await asyncio.sleep(BATCH_FLUSH_INTERVAL)
 
@@ -128,7 +185,22 @@ async def process_task(
     rate_limiter: RateLimiter,
     fetch_delay: float = 4.0,
 ):
-    """Fetch a player profile and put the result into the batch queue."""
+    """Fetch one player profile and enqueue the result for batch delivery.
+
+    Acquires *semaphore* before doing any work so the total number of
+    in-flight fetches stays within ``max_concurrent``.  Within the semaphore,
+    acquires a token from *rate_limiter* (may sleep) before calling the network.
+
+    On ``PROFILE_PRIVATE`` from RuneMetrics the hiscores endpoint is tried as a
+    fallback; if that also fails the task is reported as ``PROFILE_PRIVATE``.
+
+    Sleeps for *fetch_delay* seconds after the fetch completes (inside the
+    semaphore hold) to spread load evenly across the hour.
+
+    The result dict placed in *result_queue* matches the schema expected by
+    ``batch_sender_loop`` and ultimately the server's ``process_success_item``
+    / ``process_error_item`` handlers.
+    """
     async with semaphore:
         task_id = task["task_id"]
         username = task["username"]
@@ -177,7 +249,21 @@ async def process_task(
 
 
 async def run(master_url: str, max_concurrent: int = 5):
-    """Main worker loop — connect, authenticate, process tasks."""
+    """Connect to the master server and run the worker until interrupted.
+
+    Loads credentials from ``~/.runespy/`` (worker_id, private key, shared
+    secret) then enters an outer reconnection loop.  On each connection attempt:
+
+    1. Open WebSocket to ``/api/workers/ws/connect?worker_id=<id>``.
+    2. Complete the two-factor auth handshake (Ed25519 + HMAC challenge-response).
+    3. Apply server-supplied config (fetch delay, concurrency, rate limit).
+    4. Advertise capacity with a ``ready`` message.
+    5. Dispatch incoming ``assign_batch`` tasks as concurrent coroutines.
+    6. Handle live ``config`` updates (rebuild semaphore / rate limiter in-place).
+    7. Respond to ``shutdown`` by breaking the inner loop cleanly.
+
+    Connection failures reconnect after 10 s; unexpected errors after 30 s.
+    """
     setup_logging()
 
     worker_id = load_worker_id()

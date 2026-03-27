@@ -1,4 +1,25 @@
-"""CLI for the RuneSpy distributed worker client."""
+"""CLI for the RuneSpy distributed worker client.
+
+Commands
+--------
+register    Generate an Ed25519 keypair, register with the master server,
+            and print the worker ID to share with the admin for approval.
+            Blocked if a keypair already exists to prevent accidental
+            overwriting of credentials.
+
+save-secret Decrypt the encrypted secret blob issued by the admin and write
+            the raw 32-byte secret to ``~/.runespy/worker_secret.key``.
+            Must be run before ``run``.
+
+run         Connect to the master, authenticate, and start processing tasks.
+            Requires all three credential files to be present.
+
+status      Query the REST API for the worker's current status (pending /
+            approved).  Does not retrieve or display the shared secret.
+
+All credential files live in ``~/.runespy/``.  See ``crypto.py`` for details
+on the key format and secret delivery scheme.
+"""
 
 import asyncio
 import json
