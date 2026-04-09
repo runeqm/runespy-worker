@@ -1,190 +1,267 @@
-from pathlib import Path
-from subprocess import run, CalledProcessError, Popen
+"""Minimal web UI for runespy-worker setup, monitoring, and proxy configuration.
 
-from flask import Flask, request, redirect, url_for
+Wraps the CLI commands (register, save-secret, run) and reads the stats/logs
+files written by the worker process to display a live dashboard.
+"""
+
+import json
+import socket
+from pathlib import Path
+from subprocess import CalledProcessError, Popen, run
+
+from flask import Flask, redirect, render_template, request, url_for
 
 app = Flask(__name__)
 RUNE_HOME = Path.home() / ".runespy"
 MASTER_URL = "wss://runespy.com"
 
-# Track the worker process started by this app
-worker_process: Popen | None = None
+# Worker subprocess handle
+_worker_proc: Popen | None = None
 
 
-def read_worker_files():
-    wid_path = RUNE_HOME / "worker_id"
-    key_path = RUNE_HOME / "worker_key.pem"
-    secret_path = RUNE_HOME / "worker_secret.key"
-    name_path = RUNE_HOME / "worker_name"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    wid = wid_path.read_text().strip() if wid_path.exists() else None
-    key_pem = key_path.read_bytes() if key_path.exists() else None
-    secret = secret_path.read_bytes() if secret_path.exists() else None
-    name = name_path.read_text().strip() if name_path.exists() else None
-    return wid, key_pem, secret, name
+def _read_file(name: str) -> str | None:
+    p = RUNE_HOME / name
+    return p.read_text().strip() if p.exists() else None
 
 
-def write_worker_name(name: str) -> None:
+def _has_file(name: str) -> bool:
+    return (RUNE_HOME / name).exists()
+
+
+def _read_proxy_config() -> tuple[str | None, str | None]:
+    """Read saved proxy configuration."""
+    webshare_key = _read_file("webshare_api_key")
+    proxy_url = _read_file("proxy_url")
+    return webshare_key, proxy_url
+
+
+def _save_proxy_config(webshare_api_key: str | None, proxy_url: str | None):
     RUNE_HOME.mkdir(parents=True, exist_ok=True)
-    (RUNE_HOME / "worker_name").write_text(name.strip())
-
-
-def is_worker_running() -> bool:
-    """Check if the worker process we started is still running."""
-    global worker_process
-    if worker_process is None:
-        return False
-    return worker_process.poll() is None  # None means still running
-
-
-def start_worker():
-    """Start worker if not already running."""
-    global worker_process
-    if not is_worker_running():
-        worker_process = Popen(
-            ["runespy-worker", "run", "--master", MASTER_URL]
-        )
-
-
-@app.route("/", methods=["GET"])
-def index():
-    worker_id, key_pem, secret, worker_name = read_worker_files()
-
-    creds_status = "yes" if (worker_id and key_pem and secret) else "no"
-    secret_saved = "yes" if secret else "no"
-    worker_running = "yes" if is_worker_running() else "no"
-
-    # Name input: only show textbox if we don't have a saved name yet.
-    if worker_name:
-        name_html = f"<p>Worker name: <code>{worker_name}</code></p>"
-        name_input = ""
+    key_path = RUNE_HOME / "webshare_api_key"
+    url_path = RUNE_HOME / "proxy_url"
+    if webshare_api_key:
+        key_path.write_text(webshare_api_key.strip())
+        url_path.unlink(missing_ok=True)
+    elif proxy_url:
+        url_path.write_text(proxy_url.strip())
+        key_path.unlink(missing_ok=True)
     else:
-        name_html = "<p>Worker name: <em>not set</em></p>"
-        name_input = """
-      <p>Set worker name: <input name="name" value="your-machine-name"/></p>
-"""
+        key_path.unlink(missing_ok=True)
+        url_path.unlink(missing_ok=True)
 
-    # Secret textarea only if not yet saved.
-    secret_form_html = ""
-    if not secret:
-        secret_form_html = """
-    <form method="post" action="/save-secret">
-      <textarea name="encrypted" rows="4" cols="80"
-        placeholder="Paste encrypted_secret base64 here"></textarea><br/>
-      <button type="submit">Save secret</button>
-    </form>
-"""
 
-    return f"""
-<html>
-  <body>
-    <h1>RuneSpy Worker Web UI</h1>
+def _read_stats() -> dict | None:
+    p = RUNE_HOME / "stats.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
-    <h2>1. Register</h2>
-    <p>Master URL: <code>{MASTER_URL}</code></p>
-    {name_html}
-    <form method="post" action="/register">
-      {name_input}
-      <button type="submit">Register</button>
-    </form>
-    <p>Current worker ID: <code>{worker_id or "not registered"}</code></p>
 
-    <h2>2. Secret</h2>
-    <p>Credentials present: <code>{creds_status}</code></p>
-    <p>Secret saved: <code>{secret_saved}</code></p>
-    {secret_form_html}
+def _read_logs() -> list[str]:
+    p = RUNE_HOME / "logs.json"
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
 
-    <h2>3. Worker</h2>
-    <p>Worker running (this container): <code>{worker_running}</code></p>
-    <form method="post" action="/run-worker">
-      <button type="submit" {"disabled" if not secret else ""}>Start worker</button>
-    </form>
-    <form method="post" action="/restart-worker">
-      <button type="submit" {"disabled" if not secret else ""}>Restart worker</button>
-    </form>
-  </body>
-</html>
-"""
+
+def _format_uptime(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h {m}m"
+
+
+def _is_running() -> bool:
+    global _worker_proc
+    if _worker_proc is None:
+        return False
+    return _worker_proc.poll() is None
+
+
+def _build_worker_cmd() -> list[str]:
+    cmd = ["uv", "run", "runespy-worker", "run", "--master", MASTER_URL]
+    webshare_key, proxy_url = _read_proxy_config()
+    if webshare_key:
+        cmd += ["--webshare-api-key", webshare_key]
+    elif proxy_url:
+        cmd += ["--proxy-url", proxy_url]
+    return cmd
+
+
+def _start_worker():
+    global _worker_proc
+    if not _is_running():
+        _worker_proc = Popen(_build_worker_cmd())
+
+
+def _stop_worker():
+    global _worker_proc
+    if _is_running():
+        _worker_proc.terminate()
+        try:
+            _worker_proc.wait(timeout=5)
+        except Exception:
+            _worker_proc.kill()
+        _worker_proc = None
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    worker_id = _read_file("worker_id")
+    worker_name = _read_file("worker_name")
+    has_secret = _has_file("worker_secret.key")
+    is_running = _is_running()
+
+    stats = _read_stats()
+    logs = _read_logs()
+    webshare_api_key, proxy_url = _read_proxy_config()
+
+    worker_status = None
+    uptime_display = "0s"
+    proxy_count = 0
+    if stats:
+        worker_status = stats.get("status")
+        uptime_display = _format_uptime(stats.get("uptime", 0))
+        proxy_count = stats.get("proxy_count", 0)
+    elif is_running:
+        worker_status = "starting"
+
+    flash_error = request.args.get("error")
+    flash_success = request.args.get("success")
+
+    return render_template("index.html",
+        worker_id=worker_id,
+        worker_name=worker_name,
+        has_secret=has_secret,
+        is_running=is_running,
+        worker_status=worker_status,
+        stats=stats,
+        logs=logs,
+        uptime_display=uptime_display,
+        webshare_api_key=webshare_api_key,
+        proxy_url=proxy_url,
+        proxy_count=proxy_count,
+        flash_error=flash_error,
+        flash_success=flash_success,
+    )
 
 
 @app.route("/register", methods=["POST"])
 def register():
-    _, _, _, existing_name = read_worker_files()
-    name = existing_name or request.form.get("name", "").strip() or "your-machine-name"
+    name = request.form.get("name", "").strip()
+    if not name:
+        name = socket.gethostname()
 
-    # Persist name so it's constant after first set.
-    write_worker_name(name)
+    # Persist name
+    RUNE_HOME.mkdir(parents=True, exist_ok=True)
+    (RUNE_HOME / "worker_name").write_text(name)
 
     try:
         run(
-            [
-                "runespy-worker",
-                "register",
-                "--master",
-                MASTER_URL,
-                "--name",
-                name,
-            ],
+            ["uv", "run", "runespy-worker", "register", "--master", MASTER_URL, "--name", name],
             check=True,
         )
     except CalledProcessError as e:
-        return f"Error running register: {e}", 500
-    return redirect(url_for("index"))
+        return redirect(url_for("index", error=f"Registration failed: {e}"))
+
+    return redirect(url_for("index", success="Registered successfully. Share your worker ID with the admin."))
 
 
 @app.route("/save-secret", methods=["POST"])
 def save_secret():
     encrypted = request.form.get("encrypted", "").strip()
     if not encrypted:
-        return "Missing encrypted secret", 400
+        return redirect(url_for("index", error="No encrypted secret provided."))
 
     try:
         run(
-            ["runespy-worker", "save-secret", "--encrypted", encrypted],
+            ["uv", "run", "runespy-worker", "save-secret", "--encrypted", encrypted],
             check=True,
         )
     except CalledProcessError as e:
-        return f"Error running save-secret: {e}", 500
+        return redirect(url_for("index", error=f"Failed to save secret: {e}"))
 
-    # Secret is on disk now; auto-start worker.
-    start_worker()
-    return redirect(url_for("index"))
+    _start_worker()
+    return redirect(url_for("index", success="Secret saved. Worker started."))
 
 
-def require_worker_secret():
-    _, _, secret, _ = read_worker_files()
-    if not secret:
-        return "Worker secret is missing; save the secret before starting the worker", 409
-    return None
+@app.route("/save-proxy-config", methods=["POST"])
+def save_proxy_config():
+    webshare_key = request.form.get("webshare_api_key", "").strip() or None
+    proxy_url = request.form.get("proxy_url", "").strip() or None
+
+    if webshare_key and proxy_url:
+        return redirect(url_for("index", error="Choose either Webshare API key or a single proxy URL, not both."))
+
+    _save_proxy_config(webshare_key, proxy_url)
+
+    if _is_running():
+        _stop_worker()
+        _start_worker()
+        return redirect(url_for("index", success="Proxy config saved. Worker restarted."))
+
+    return redirect(url_for("index", success="Proxy config saved."))
 
 
 @app.route("/run-worker", methods=["POST"])
 def run_worker():
-    error = require_worker_secret()
-    if error is not None:
-        return error
-
-    start_worker()
-    return redirect(url_for("index"))
+    if not _has_file("worker_secret.key"):
+        return redirect(url_for("index", error="Save the shared secret first."))
+    _start_worker()
+    return redirect(url_for("index", success="Worker started."))
 
 
 @app.route("/restart-worker", methods=["POST"])
 def restart_worker():
-    error = require_worker_secret()
-    if error is not None:
-        return error
-    global worker_process
-    if is_worker_running():
-        worker_process.terminate()
-    start_worker()
-    return redirect(url_for("index"))
+    if not _has_file("worker_secret.key"):
+        return redirect(url_for("index", error="Save the shared secret first."))
+    _stop_worker()
+    _start_worker()
+    return redirect(url_for("index", success="Worker restarted."))
 
+
+@app.route("/stop-worker", methods=["POST"])
+def stop_worker():
+    _stop_worker()
+    return redirect(url_for("index", success="Worker stopped."))
+
+
+# ---------------------------------------------------------------------------
+# JSON API for programmatic access
+# ---------------------------------------------------------------------------
+
+@app.route("/api/stats")
+def api_stats():
+    stats = _read_stats() or {}
+    stats["logs"] = _read_logs()[-50:]
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 def main():
-    # On container start, if secret exists, auto-start worker.
-    _, _, secret, _ = read_worker_files()
-    if secret:
-        start_worker()
+    # Auto-start worker if credentials are present
+    if _has_file("worker_secret.key"):
+        _start_worker()
 
     app.run(host="0.0.0.0", port=8080)
 

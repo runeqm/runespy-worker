@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RuneSpy Worker</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #232733;
+      --border: #2e3344;
+      --text: #e1e4ed;
+      --text-dim: #8b8fa3;
+      --accent: #6c8aff;
+      --accent-dim: #4a5e99;
+      --green: #4ade80;
+      --green-dim: #166534;
+      --red: #f87171;
+      --red-dim: #7f1d1d;
+      --yellow: #fbbf24;
+      --yellow-dim: #713f12;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    .container { max-width: 800px; margin: 0 auto; padding: 24px 16px; }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 20px; font-weight: 600; }
+    .header .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-weight: 500;
+    }
+
+    /* Status badges */
+    .badge-running { background: var(--green-dim); color: var(--green); }
+    .badge-connecting, .badge-reconnecting { background: var(--yellow-dim); color: var(--yellow); }
+    .badge-stopped, .badge-error { background: var(--red-dim); color: var(--red); }
+    .badge-starting, .badge-authenticated { background: var(--accent-dim); color: var(--accent); }
+
+    /* Cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin-bottom: 16px;
+    }
+
+    /* Stepper */
+    .step { position: relative; }
+    .step.done .step-header { color: var(--text-dim); }
+    .step.done .step-num { background: var(--green-dim); color: var(--green); }
+    .step.active .step-num { background: var(--accent); color: #fff; }
+    .step.locked .step-header { color: var(--text-dim); opacity: 0.5; }
+    .step.locked .step-num { background: var(--surface2); color: var(--text-dim); }
+    .step-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .step-num {
+      width: 26px; height: 26px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 600;
+      flex-shrink: 0;
+      background: var(--surface2);
+      color: var(--text-dim);
+    }
+    .step-title { font-size: 15px; font-weight: 500; }
+    .step-body { padding-left: 36px; margin-bottom: 8px; }
+    .step-check { color: var(--green); }
+
+    /* Forms */
+    .form-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    input[type="text"], textarea {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 8px 12px;
+      font-size: 14px;
+      font-family: inherit;
+      width: 100%;
+    }
+    input[type="text"]:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+    textarea { resize: vertical; min-height: 60px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+    label { font-size: 13px; color: var(--text-dim); display: block; margin-bottom: 4px; }
+    .field { margin-bottom: 12px; }
+
+    /* Buttons */
+    button, .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      text-decoration: none;
+      display: inline-block;
+    }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.3; cursor: not-allowed; }
+    .btn-danger { background: var(--red-dim); color: var(--red); }
+    .btn-success { background: var(--green-dim); color: var(--green); }
+    .btn-secondary { background: var(--surface2); color: var(--text-dim); }
+    .btn-sm { padding: 5px 12px; font-size: 12px; }
+    .btn-group { display: flex; gap: 8px; }
+
+    /* Stats grid */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+    }
+    .stat-card {
+      background: var(--surface2);
+      border-radius: 6px;
+      padding: 14px;
+    }
+    .stat-value { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat-label { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+    /* Config display */
+    .config-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 8px;
+    }
+    .config-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 8px 12px;
+      background: var(--surface2);
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .config-key { color: var(--text-dim); }
+    .config-val { font-weight: 500; font-family: 'SF Mono', 'Fira Code', monospace; }
+
+    /* Log viewer */
+    .log-viewer {
+      background: #0a0c10;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      max-height: 350px;
+      overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--text-dim);
+    }
+    .log-viewer::-webkit-scrollbar { width: 6px; }
+    .log-viewer::-webkit-scrollbar-track { background: transparent; }
+    .log-viewer::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .log-line { white-space: pre-wrap; word-break: break-all; }
+    .log-line.log-error { color: var(--red); }
+    .log-line.log-warning { color: var(--yellow); }
+    .log-line.log-info-highlight { color: var(--green); }
+
+    /* Info text */
+    .info { font-size: 13px; color: var(--text-dim); }
+    .info code {
+      background: var(--surface2);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 12px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+
+    /* Flash messages */
+    .flash {
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .flash-error { background: var(--red-dim); color: var(--red); }
+    .flash-success { background: var(--green-dim); color: var(--green); }
+
+    /* Utility */
+    .mt-8 { margin-top: 8px; }
+    .mt-16 { margin-top: 16px; }
+    .mb-8 { margin-bottom: 8px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>RuneSpy Worker</h1>
+      {% if worker_status %}
+        <span class="badge badge-{{ worker_status }}">{{ worker_status }}</span>
+      {% else %}
+        <span class="badge badge-stopped">not running</span>
+      {% endif %}
+    </div>
+
+    {% if flash_error %}
+      <div class="flash flash-error">{{ flash_error }}</div>
+    {% endif %}
+    {% if flash_success %}
+      <div class="flash flash-success">{{ flash_success }}</div>
+    {% endif %}
+
+    {# ── Step 1: Register ── #}
+    <div class="card step {{ 'done' if worker_id else 'active' }}">
+      <div class="step-header">
+        <div class="step-num">{% if worker_id %}<span class="step-check">&#10003;</span>{% else %}1{% endif %}</div>
+        <span class="step-title">Register worker</span>
+      </div>
+      <div class="step-body">
+        {% if worker_id %}
+          <p class="info">Registered as <code>{{ worker_id }}</code></p>
+          {% if worker_name %}<p class="info">Name: <code>{{ worker_name }}</code></p>{% endif %}
+        {% else %}
+          <form method="post" action="/register">
+            <div class="field">
+              <label>Worker name</label>
+              <input type="text" name="name" placeholder="my-macbook" required>
+            </div>
+            <button type="submit">Register with master</button>
+          </form>
+          <p class="info mt-8">This generates an Ed25519 keypair and registers with the master server.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ── Step 2: Save secret ── #}
+    <div class="card step {{ 'done' if has_secret else ('active' if worker_id else 'locked') }}">
+      <div class="step-header">
+        <div class="step-num">{% if has_secret %}<span class="step-check">&#10003;</span>{% else %}2{% endif %}</div>
+        <span class="step-title">Save shared secret</span>
+      </div>
+      <div class="step-body">
+        {% if has_secret %}
+          <p class="info">Shared secret is saved.</p>
+        {% elif worker_id %}
+          <p class="info mb-8">Share your worker ID with the RuneSpy admin. Once approved, paste the encrypted secret below.</p>
+          <form method="post" action="/save-secret">
+            <div class="field">
+              <label>Encrypted secret (base64)</label>
+              <textarea name="encrypted" placeholder="Paste the base64 blob from the admin here..." required></textarea>
+            </div>
+            <button type="submit">Save secret</button>
+          </form>
+        {% else %}
+          <p class="info">Register first to get a worker ID.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ── Step 3: Proxy configuration ── #}
+    <div class="card step {{ 'active' if has_secret and not is_running else ('done' if has_secret else 'locked') }}">
+      <div class="step-header">
+        <div class="step-num">3</div>
+        <span class="step-title">Proxy configuration <span class="info">(optional)</span></span>
+      </div>
+      <div class="step-body">
+        {% if has_secret %}
+          <p class="info mb-8">Route API requests through proxies for higher throughput. Leave empty to fetch directly.</p>
+          <form method="post" action="/save-proxy-config">
+            <div class="field">
+              <label>Webshare API key</label>
+              <input type="text" name="webshare_api_key" value="{{ webshare_api_key or '' }}" placeholder="bevvqpw6ox1mqo3742ivywazluq1ofq9eeve54fh">
+            </div>
+            <p class="info mb-8">— or —</p>
+            <div class="field">
+              <label>Single proxy URL</label>
+              <input type="text" name="proxy_url" value="{{ proxy_url or '' }}" placeholder="http://user:pass@host:port">
+            </div>
+            <button type="submit">Save proxy config</button>
+            {% if webshare_api_key or proxy_url %}
+              <span class="info" style="margin-left: 8px;">Currently configured: <code>{{ 'Webshare (' + proxy_count|string + ' proxies)' if webshare_api_key else proxy_url }}</code></span>
+            {% endif %}
+          </form>
+        {% else %}
+          <p class="info">Complete registration first.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ── Step 4: Run worker ── #}
+    <div class="card step {{ 'active' if has_secret else 'locked' }}">
+      <div class="step-header">
+        <div class="step-num">4</div>
+        <span class="step-title">Run worker</span>
+      </div>
+      <div class="step-body">
+        {% if has_secret %}
+          <div class="btn-group">
+            {% if is_running %}
+              <form method="post" action="/restart-worker"><button type="submit" class="btn-danger">Restart</button></form>
+              <form method="post" action="/stop-worker"><button type="submit" class="btn-danger">Stop</button></form>
+            {% else %}
+              <form method="post" action="/run-worker"><button type="submit" class="btn-success">Start worker</button></form>
+            {% endif %}
+          </div>
+        {% else %}
+          <p class="info">Save the shared secret before starting.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ── Stats dashboard (only when running or has stats) ── #}
+    {% if stats %}
+    <div class="card">
+      <h2>Statistics</h2>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value">{{ stats.stats.completed }}</div>
+          <div class="stat-label">Tasks completed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ stats.stats.failed }}</div>
+          <div class="stat-label">Tasks failed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ stats.stats.batches_received }}</div>
+          <div class="stat-label">Batches received</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ stats.stats.batches_sent }}</div>
+          <div class="stat-label">Batches sent</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ uptime_display }}</div>
+          <div class="stat-label">Uptime</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value">{{ stats.proxy_count }}</div>
+          <div class="stat-label">Proxies</div>
+        </div>
+      </div>
+
+      {% if stats.config %}
+      <h2 class="mt-16">Server config</h2>
+      <div class="config-grid">
+        <div class="config-item">
+          <span class="config-key">Rate limit</span>
+          <span class="config-val">{{ stats.config.rate_limit_per_hour }}/hr</span>
+        </div>
+        <div class="config-item">
+          <span class="config-key">Fetch delay</span>
+          <span class="config-val">{{ stats.config.fetch_delay }}s</span>
+        </div>
+        <div class="config-item">
+          <span class="config-key">Concurrency</span>
+          <span class="config-val">{{ stats.config.max_concurrent }}</span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {# ── Log viewer ── #}
+    {% if logs %}
+    <div class="card">
+      <h2>Recent logs</h2>
+      <div class="log-viewer" id="log-viewer">
+        {% for line in logs %}
+          <div class="log-line {{ 'log-error' if '[ERROR]' in line or '[WARNING]' in line and 'Failed' in line else ('log-warning' if '[WARNING]' in line else ('log-info-highlight' if 'Fetched' in line or 'Batch sent' in line or 'Authenticated' in line else '')) }}">{{ line }}</div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    // Auto-scroll log viewer to bottom
+    const lv = document.getElementById('log-viewer');
+    if (lv) lv.scrollTop = lv.scrollHeight;
+
+    // Auto-refresh when worker is running
+    {% if is_running %}
+    setTimeout(() => location.reload(), 10000);
+    {% endif %}
+  </script>
+</body>
+</html>

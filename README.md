@@ -107,70 +107,62 @@ This shows whether your worker is `pending` or `approved`. It does **not** retri
 
 ## Web UI (Docker)
 
-If you prefer a simple browser UI instead of running the CLI directly, you can use the built-in web UI. It wraps the same `register`, `save-secret`, and `run` commands behind a minimal Flask app and runs everything inside a Docker container.[file:141]
+The built-in web UI provides a browser-based interface for registration, secret management, proxy configuration, and live monitoring. It wraps the same CLI commands behind a Flask app running inside Docker.
 
-### Build the web UI image
-
-From the repository root:
+### Build
 
 ```bash
-docker build -t runespy-worker-ui .
+docker build -t runespy-worker .
 ```
 
-This uses the provided `Dockerfile` to install `runespy-worker` and run the web UI on port 8080.[file:45]
-
-### Run the web UI
+### Run (web UI mode)
 
 ```bash
-docker run --rm \
-  -p 8080:8080 \
+docker run -d \
+  -p 127.0.0.1:8080:8080 \
   -v $HOME/.runespy:/root/.runespy \
-  runespy-worker-ui
+  --name runespy-worker \
+  --restart unless-stopped \
+  runespy-worker
 ```
 
-Then open `http://localhost:8080` in your browser.
+Open `http://localhost:8080` in your browser. The `~/.runespy` directory is bind-mounted so credentials persist across container restarts.
 
-The `~/.runespy` directory is bind-mounted from the host so the web UI and any CLI usage share the same credentials (`worker_id`, keypair, and secret). Credentials persist across container restarts. The container does not automatically create credentials or connect to the master on startup; instead, use the web UI flow below to register the worker and save the approved secret into the shared `~/.runespy` directory.
+### Run (headless mode)
 
-### Flow
+For pre-configured workers that don't need the web UI (e.g. servers), use the entrypoint script:
 
-1. **Register**
+```bash
+docker run -d \
+  --entrypoint /entrypoint.sh \
+  -e WORKER_ID="$(cat ~/.runespy/worker_id)" \
+  -e WORKER_KEY_PEM_B64="$(base64 < ~/.runespy/worker_key.pem)" \
+  -e WORKER_SECRET_B64="$(base64 < ~/.runespy/worker_secret.key)" \
+  -e MASTER_URL="wss://runespy.com" \
+  -e WEBSHARE_API_KEY="your-api-key" \
+  --name runespy-worker \
+  --restart unless-stopped \
+  runespy-worker
+```
 
-   - Enter a worker name and click **Register**.
-   - The UI runs:
+### Web UI flow
 
-     ```bash
-     runespy-worker register --master wss://runespy.com --name <name>
-     ```
+The UI guides you through four steps:
 
-   - This writes `worker_key.pem` and `worker_id` into `~/.runespy`, and the UI shows your worker ID so you can send it to the RuneSpy admin for approval.
+1. **Register** — enter a worker name, generates an Ed25519 keypair and registers with the master. Shows your worker ID to share with the admin.
 
-2. **Save secret**
+2. **Save secret** — paste the encrypted secret blob from the admin. The worker starts automatically once saved.
 
-   - After the admin approves your worker and sends you the `encrypted_secret` blob, paste it into the **Save secret** form.
-   - The UI runs:
+3. **Proxy configuration** (optional) — enter a Webshare API key or single proxy URL. The worker restarts automatically to pick up the new config.
 
-     ```bash
-     runespy-worker save-secret --encrypted <base64_blob>
-     ```
+4. **Run / Stop / Restart** — control the worker process. If a secret is present when the container starts, the worker starts automatically.
 
-   - This writes `worker_secret.key` into `~/.runespy`. Once the secret is saved, the UI hides the secret input and marks the secret as saved.
+The dashboard shows live statistics (tasks completed/failed, batches, uptime, proxy count), the server-assigned config (rate limit, concurrency, fetch delay), and a scrolling log viewer.
 
-3. **Run and manage the worker**
+To keep the container running across reboots, ensure Docker starts on login:
 
-   - When the secret is present, the UI can start the worker inside the same container with:
-
-     ```bash
-     runespy-worker run --master wss://runespy.com
-     ```
-
-   - The page shows whether the worker process is currently running and exposes **Start worker** and **Restart worker** buttons.
-   - On container start, if a secret already exists in `~/.runespy`, the worker is started automatically.
-
-- **Linux**: `sudo systemctl enable docker` (often already enabled)
-- **macOS / Windows**: Docker Desktop → Settings → General → enable "Start Docker Desktop when you log in"
-
-The container writes credentials to `~/.runespy/` at startup and connects to the master automatically.
+- **Linux**: `sudo systemctl enable docker`
+- **macOS / Windows**: Docker Desktop → Settings → General → "Start Docker Desktop when you log in"
 
 ---
 

@@ -42,8 +42,11 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import time
+from collections import deque
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import websockets
@@ -102,17 +105,69 @@ class RateLimiter:
 
 def setup_logging():
     """Configure worker logging with timestamps and colours."""
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
+    fmt = logging.Formatter(
         "\033[2m%(asctime)s\033[0m [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
-    ))
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(fmt)
     logger.addHandler(handler)
+
+    stats_handler = _StatsLogHandler()
+    stats_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logger.addHandler(stats_handler)
     logger.setLevel(logging.INFO)
 
 
-# Counters shared with heartbeat
-_stats = {"completed": 0, "failed": 0}
+# Counters shared with heartbeat and stats file
+_stats = {"completed": 0, "failed": 0, "batches_received": 0, "batches_sent": 0}
+_state: dict = {
+    "status": "starting",
+    "worker_id": None,
+    "connected_since": None,
+    "config": {},
+    "proxy_count": 0,
+}
+_recent_logs: deque[str] = deque(maxlen=200)
+_STATS_PATH = Path.home() / ".runespy" / "stats.json"
+_LOGS_PATH = Path.home() / ".runespy" / "logs.json"
+
+
+class _StatsLogHandler(logging.Handler):
+    """Captures log lines into _recent_logs for the web UI."""
+
+    _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+    def emit(self, record):
+        line = self.format(record)
+        clean = self._ANSI_RE.sub("", line)
+        _recent_logs.append(clean)
+
+
+def _write_stats():
+    """Write current stats + state to JSON files for the web UI."""
+    data = {
+        **_state,
+        "stats": {**_stats},
+        "uptime": int(time.time() - _state.get("_start_time", time.time())),
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
+    data.pop("_start_time", None)
+    try:
+        _STATS_PATH.write_text(json.dumps(data))
+        _LOGS_PATH.write_text(json.dumps(list(_recent_logs)))
+    except OSError:
+        pass
+
+
+async def stats_writer_loop(interval: float = 5.0):
+    """Periodically write stats to disk for the web UI."""
+    while True:
+        _write_stats()
+        await asyncio.sleep(interval)
 
 
 async def heartbeat_loop(ws, worker_id: str, secret: bytes, interval: float = 30.0):
@@ -165,6 +220,7 @@ async def batch_sender_loop(
         msg = build_message("batch_result", {"results": items}, worker_id, secret)
         try:
             await ws.send(msg)
+            _stats["batches_sent"] += 1
             logger.info(
                 "\033[32mBatch sent\033[0m — %d result(s)",
                 len(items),
@@ -289,6 +345,10 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
     private_key = load_private_key()
     secret = load_secret()
 
+    _state["worker_id"] = worker_id
+    _state["_start_time"] = time.time()
+    _state["status"] = "connecting"
+
     logger.info("Worker ID: %s", worker_id)
     logger.info("Ed25519 public key loaded")
     logger.info("HMAC shared secret loaded (%d bytes)", len(secret))
@@ -300,11 +360,16 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
             masked = p.split("@")[-1] if "@" in p else p
             logger.info("Proxy: %s", masked)
         logger.info("Rotating across %d proxies", len(proxy_urls))
+    _state["proxy_count"] = len(proxy_urls or [])
 
     ws_url = f"{master_url}/api/workers/ws/connect?worker_id={worker_id}"
 
+    stats_task = asyncio.create_task(stats_writer_loop())
+
     while True:
         try:
+            _state["status"] = "connecting"
+            _write_stats()
             logger.info("Connecting to %s ...", master_url)
             async with websockets.connect(ws_url) as ws:
                 logger.info("\033[32mConnected\033[0m to %s", master_url)
@@ -347,6 +412,13 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                     fetch_delay = payload.get("fetch_delay", 3.0)
                     max_concurrent = payload.get("max_concurrent", max_concurrent)
                     rate_limit_per_hour = payload.get("rate_limit_per_hour", 300)
+                    _state["status"] = "authenticated"
+                    _state["connected_since"] = datetime.now(UTC).isoformat()
+                    _state["config"] = {
+                        "fetch_delay": fetch_delay,
+                        "max_concurrent": max_concurrent,
+                        "rate_limit_per_hour": rate_limit_per_hour,
+                    }
                     logger.info(
                         "\033[32mAuthenticated\033[0m — fetch_delay=%.1fs, max_concurrent=%d, rate_limit=%d/hr",
                         fetch_delay, max_concurrent, rate_limit_per_hour,
@@ -363,6 +435,8 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                     ready_payload["proxy_count"] = len(proxy_urls)
                 ready_msg = build_message("ready", ready_payload, worker_id, secret)
                 await ws.send(ready_msg)
+                _state["status"] = "running"
+                _write_stats()
                 logger.info("Sent ready (capacity=%d, proxies=%d) — waiting for tasks", max_concurrent, len(proxy_urls or []))
 
                 semaphore = asyncio.Semaphore(max_concurrent)
@@ -382,6 +456,7 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
 
                         if msg_type == "assign_batch":
                             tasks = msg.get("payload", {}).get("tasks", [])
+                            _stats["batches_received"] += 1
                             usernames = [t["username"] for t in tasks]
                             logger.info(
                                 "\033[33mBatch received\033[0m — %d task(s): %s",
@@ -409,6 +484,11 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                                 max_concurrent = new_concurrent
                             if new_rate is not None:
                                 rate_limiter = RateLimiter(rate=int(new_rate))
+                            _state["config"] = {
+                                "fetch_delay": fetch_delay,
+                                "max_concurrent": max_concurrent,
+                                "rate_limit_per_hour": rate_limiter._rate,
+                            }
                             logger.info(
                                 "\033[36mConfig updated\033[0m — fetch_delay=%.1fs, max_concurrent=%d, rate_limit=%d/hr",
                                 fetch_delay, max_concurrent, rate_limiter._rate,
@@ -440,8 +520,14 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                     batch_task.cancel()
 
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+            _state["status"] = "reconnecting"
+            _state["connected_since"] = None
+            _write_stats()
             logger.warning("Connection lost: %s. Reconnecting in 10s...", e)
             await asyncio.sleep(10)
         except Exception as e:
+            _state["status"] = "reconnecting"
+            _state["connected_since"] = None
+            _write_stats()
             logger.error("Error: %s. Reconnecting in 30s...", e)
             await asyncio.sleep(30)
