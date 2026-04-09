@@ -545,7 +545,9 @@
         // Logs — append only new lines
         const viewer = document.getElementById('log-viewer');
         if (viewer && d.logs) {
-          const newLines = d.logs.length > prevLogCount ? d.logs.slice(prevLogCount) : [];
+          // Check scroll position BEFORE appending
+          const atBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 50;
+
           if (d.logs.length < prevLogCount) {
             // Log was reset (worker restarted)
             viewer.innerHTML = '';
@@ -555,8 +557,8 @@
               div.textContent = line;
               viewer.appendChild(div);
             });
-          } else {
-            newLines.forEach(line => {
+          } else if (d.logs.length > prevLogCount) {
+            d.logs.slice(prevLogCount).forEach(line => {
               const div = document.createElement('div');
               div.className = 'log-line ' + classifyLog(line);
               div.textContent = line;
@@ -564,8 +566,6 @@
             });
           }
           prevLogCount = d.logs.length;
-          // Keep scrolled to bottom if user hasn't scrolled up
-          const atBottom = viewer.scrollHeight - viewer.scrollTop - viewer.clientHeight < 50;
           if (atBottom) viewer.scrollTop = viewer.scrollHeight;
         }
       } catch(e) {}
