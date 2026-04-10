@@ -138,9 +138,35 @@ def run(master, max_concurrent, proxy_url, webshare_api_key):
     elif proxy_url:
         proxy_urls = [proxy_url]
 
+    if proxy_urls:
+        if not _test_proxy(proxy_urls[0]):
+            click.echo("Proxy connectivity check failed — aborting.", err=True)
+            return
+
     from runespy_worker.client import run as client_run
     click.echo("Starting worker...")
     asyncio.run(client_run(master, max_concurrent=max_concurrent, proxy_urls=proxy_urls))
+
+
+def _test_proxy(proxy_url: str) -> bool:
+    """Test a single proxy by hitting the RuneMetrics API."""
+    import httpx as _httpx
+
+    masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+    click.echo(f"Testing proxy connectivity via {masked}...")
+    try:
+        with _httpx.Client(proxy=proxy_url) as client:
+            resp = client.get(
+                "https://apps.runescape.com/runemetrics/profile/profile",
+                params={"user": "Zezima", "activities": 0},
+                timeout=10,
+            )
+            resp.raise_for_status()
+        click.echo("Proxy check passed")
+        return True
+    except Exception as e:
+        click.echo(f"Proxy check failed: {e}", err=True)
+        return False
 
 
 def _fetch_webshare_proxies(api_key: str, retries: int = 3) -> list[str]:
