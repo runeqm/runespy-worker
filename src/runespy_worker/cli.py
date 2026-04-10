@@ -132,16 +132,16 @@ def run(master, max_concurrent, proxy_url, webshare_api_key):
     if webshare_api_key:
         proxy_urls = _fetch_webshare_proxies(webshare_api_key)
         if not proxy_urls:
-            click.echo("Failed to fetch proxies from Webshare.", err=True)
-            return
-        click.echo(f"Loaded {len(proxy_urls)} proxies from Webshare")
+            click.echo("Failed to fetch proxies from Webshare — falling back to direct.", err=True)
+        else:
+            click.echo(f"Loaded {len(proxy_urls)} proxies from Webshare")
     elif proxy_url:
         proxy_urls = [proxy_url]
 
     if proxy_urls:
         if not _test_proxy(proxy_urls[0]):
-            click.echo("Proxy connectivity check failed — aborting.", err=True)
-            return
+            click.echo("Proxy check failed — falling back to direct (no proxy).", err=True)
+            proxy_urls = []
 
     from runespy_worker.client import run as client_run
     click.echo("Starting worker...")
