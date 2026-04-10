@@ -90,6 +90,7 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self):
+        wait = 0.0
         async with self._lock:
             now = time.monotonic()
             elapsed = now - self._last
@@ -97,10 +98,11 @@ class RateLimiter:
             self._tokens = min(self._rate, self._tokens + elapsed * self._refill_rate)
             if self._tokens < 1:
                 wait = (1 - self._tokens) / self._refill_rate
-                await asyncio.sleep(wait)
                 self._tokens = 0
             else:
                 self._tokens -= 1
+        if wait:
+            await asyncio.sleep(wait)
 
 
 def setup_logging():
@@ -147,6 +149,13 @@ class _StatsLogHandler(logging.Handler):
         _recent_logs.append(clean)
 
 
+def _atomic_write(path: Path, content: str):
+    """Write to a temp file then atomically rename to avoid partial reads."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
 def _write_stats():
     """Write current stats + state to JSON files for the web UI."""
     data = {
@@ -157,8 +166,8 @@ def _write_stats():
     }
     data.pop("_start_time", None)
     try:
-        _STATS_PATH.write_text(json.dumps(data))
-        _LOGS_PATH.write_text(json.dumps(list(_recent_logs)))
+        _atomic_write(_STATS_PATH, json.dumps(data))
+        _atomic_write(_LOGS_PATH, json.dumps(list(_recent_logs)))
     except OSError:
         pass
 

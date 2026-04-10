@@ -6,6 +6,7 @@ files written by the worker process to display a live dashboard.
 
 import json
 import socket
+import threading
 from pathlib import Path
 from subprocess import CalledProcessError, Popen, run
 
@@ -15,8 +16,9 @@ app = Flask(__name__)
 RUNE_HOME = Path.home() / ".runespy"
 MASTER_URL = "wss://runespy.com"
 
-# Worker subprocess handle
+# Worker subprocess handle (guarded by _proc_lock for thread safety)
 _worker_proc: Popen | None = None
+_proc_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +87,10 @@ def _format_uptime(seconds: int) -> str:
 
 
 def _is_running() -> bool:
-    global _worker_proc
-    if _worker_proc is None:
-        return False
-    return _worker_proc.poll() is None
+    with _proc_lock:
+        if _worker_proc is None:
+            return False
+        return _worker_proc.poll() is None
 
 
 def _build_worker_cmd() -> list[str]:
@@ -103,13 +105,21 @@ def _build_worker_cmd() -> list[str]:
 
 def _start_worker():
     global _worker_proc
-    if not _is_running():
-        _worker_proc = Popen(_build_worker_cmd())
+    with _proc_lock:
+        if _worker_proc is not None and _worker_proc.poll() is None:
+            return
+        try:
+            _worker_proc = Popen(_build_worker_cmd())
+        except FileNotFoundError:
+            pass
 
 
 def _stop_worker():
     global _worker_proc
-    if _is_running():
+    with _proc_lock:
+        if _worker_proc is None or _worker_proc.poll() is not None:
+            _worker_proc = None
+            return
         _worker_proc.terminate()
         try:
             _worker_proc.wait(timeout=5)
