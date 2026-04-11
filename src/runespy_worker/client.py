@@ -132,10 +132,84 @@ _state: dict = {
     "connected_since": None,
     "config": {},
     "proxy_count": 0,
+    "in_flight": 0,
 }
 _recent_logs: deque[str] = deque(maxlen=200)
 _STATS_PATH = Path.home() / ".runespy" / "stats.json"
 _LOGS_PATH = Path.home() / ".runespy" / "logs.json"
+_TIMING_WINDOW = 200
+_timings: dict[str, deque[float]] = {
+    "fetch_ms": deque(maxlen=_TIMING_WINDOW),
+    "queue_wait_ms": deque(maxlen=_TIMING_WINDOW),
+    "total_ms": deque(maxlen=_TIMING_WINDOW),
+    "proxy_fetch_ms": deque(maxlen=_TIMING_WINDOW),
+    "direct_fetch_ms": deque(maxlen=_TIMING_WINDOW),
+    "fallback_direct_fetch_ms": deque(maxlen=_TIMING_WINDOW),
+}
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Return percentile (0..100) for a non-empty list of floats."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+    idx = max(0, min(len(ordered) - 1, idx))
+    return ordered[idx]
+
+
+def _record_request_timing(
+    fetch_ms: float,
+    queue_wait_ms: float,
+    total_ms: float,
+    *,
+    proxy_attempt_ms: float | None,
+    direct_attempt_ms: float | None,
+    fallback_direct_attempt_ms: float | None,
+):
+    """Record one request timing sample for heartbeat telemetry."""
+    _timings["fetch_ms"].append(float(fetch_ms))
+    _timings["queue_wait_ms"].append(float(queue_wait_ms))
+    _timings["total_ms"].append(float(total_ms))
+    if proxy_attempt_ms is not None:
+        _timings["proxy_fetch_ms"].append(float(proxy_attempt_ms))
+    if direct_attempt_ms is not None:
+        _timings["direct_fetch_ms"].append(float(direct_attempt_ms))
+    if fallback_direct_attempt_ms is not None:
+        _timings["fallback_direct_fetch_ms"].append(float(fallback_direct_attempt_ms))
+
+
+def _timing_snapshot() -> dict:
+    """Build compact timing stats for heartbeat payloads."""
+    fetch = list(_timings["fetch_ms"])
+    queue_wait = list(_timings["queue_wait_ms"])
+    total = list(_timings["total_ms"])
+    proxy_fetch = list(_timings["proxy_fetch_ms"])
+    direct_fetch = list(_timings["direct_fetch_ms"])
+    fallback_direct_fetch = list(_timings["fallback_direct_fetch_ms"])
+    if not fetch:
+        return {"window": 0}
+
+    snapshot = {
+        "window": len(fetch),
+        "fetch_ms_p50": round(_percentile(fetch, 50), 1),
+        "fetch_ms_p95": round(_percentile(fetch, 95), 1),
+        "queue_wait_ms_p50": round(_percentile(queue_wait, 50), 1),
+        "queue_wait_ms_p95": round(_percentile(queue_wait, 95), 1),
+        "total_ms_p50": round(_percentile(total, 50), 1),
+        "total_ms_p95": round(_percentile(total, 95), 1),
+        "last_fetch_ms": round(fetch[-1], 1),
+        "proxy_samples": len(proxy_fetch),
+        "direct_samples": len(direct_fetch),
+        "fallback_direct_samples": len(fallback_direct_fetch),
+    }
+    if proxy_fetch:
+        snapshot["proxy_fetch_ms_p95"] = round(_percentile(proxy_fetch, 95), 1)
+    if direct_fetch:
+        snapshot["direct_fetch_ms_p95"] = round(_percentile(direct_fetch, 95), 1)
+    if fallback_direct_fetch:
+        snapshot["fallback_direct_fetch_ms_p95"] = round(_percentile(fallback_direct_fetch, 95), 1)
+    return snapshot
 
 
 class _StatsLogHandler(logging.Handler):
@@ -161,6 +235,7 @@ def _write_stats():
     data = {
         **_state,
         "stats": {**_stats},
+        "request_timing": _timing_snapshot(),
         "uptime": int(time.time() - _state.get("_start_time", time.time())),
         "updated_at": datetime.now(UTC).isoformat(),
     }
@@ -194,7 +269,8 @@ async def heartbeat_loop(ws, worker_id: str, secret: bytes, interval: float = 30
             "uptime": int(time.time() - start),
             "tasks_completed": _stats["completed"],
             "tasks_failed": _stats["failed"],
-            "current_load": 0,
+            "current_load": int(_state.get("in_flight", 0)),
+            "request_timing": _timing_snapshot(),
         }, worker_id, secret)
         try:
             await ws.send(msg)
@@ -267,7 +343,10 @@ async def process_task(
     ``batch_sender_loop`` and ultimately the server's ``process_success_item``
     / ``process_error_item`` handlers.
     """
+    queued_at_ms = time.time() * 1000
+
     async with semaphore:
+        _state["in_flight"] = int(_state.get("in_flight", 0)) + 1
         task_id = task["task_id"]
         username = task["username"]
 
@@ -275,61 +354,85 @@ async def process_task(
         logger.info("\033[36mFetching\033[0m %s%s", username,
                     f" via {proxy_url.split('@')[-1]}" if proxy_url else "")
 
-        await rate_limiter.acquire()
-        start_ms = time.time() * 1000
-        async with httpx.AsyncClient(proxy=proxy_url) as client:
-            data, error = await fetch_profile(client, username)
-            if error == "PROFILE_PRIVATE":
-                logger.info("Profile private for %s, trying hiscores fallback", username)
-                data, error = await fetch_hiscores(client, username)
-                if error:
-                    error = "PROFILE_PRIVATE"
-            elif error == "NOT_A_MEMBER":
-                logger.info("Player %s is banned (NOT_A_MEMBER)", username)
-
-        # Retry direct (no proxy) on proxy failure
-        if error == "PROXY_ERROR" and proxy_url:
-            logger.warning("Proxy failed for %s, retrying direct", username)
-            async with httpx.AsyncClient() as direct_client:
-                data, error = await fetch_profile(direct_client, username)
+        try:
+            await rate_limiter.acquire()
+            start_ms = time.time() * 1000
+            proxy_attempt_ms = None
+            direct_attempt_ms = None
+            fallback_direct_attempt_ms = None
+            first_attempt_started_ms = time.time() * 1000
+            async with httpx.AsyncClient(proxy=proxy_url) as client:
+                data, error = await fetch_profile(client, username)
                 if error == "PROFILE_PRIVATE":
-                    data, error = await fetch_hiscores(direct_client, username)
+                    logger.info("Profile private for %s, trying hiscores fallback", username)
+                    data, error = await fetch_hiscores(client, username)
                     if error:
                         error = "PROFILE_PRIVATE"
                 elif error == "NOT_A_MEMBER":
                     logger.info("Player %s is banned (NOT_A_MEMBER)", username)
+            first_attempt_elapsed_ms = (time.time() * 1000) - first_attempt_started_ms
+            if proxy_url:
+                proxy_attempt_ms = first_attempt_elapsed_ms
+            else:
+                direct_attempt_ms = first_attempt_elapsed_ms
 
-        fetch_time_ms = time.time() * 1000 - start_ms
+            # Retry direct (no proxy) on proxy failure
+            if error == "PROXY_ERROR" and proxy_url:
+                logger.warning("Proxy failed for %s, retrying direct", username)
+                fallback_started_ms = time.time() * 1000
+                async with httpx.AsyncClient() as direct_client:
+                    data, error = await fetch_profile(direct_client, username)
+                    if error == "PROFILE_PRIVATE":
+                        data, error = await fetch_hiscores(direct_client, username)
+                        if error:
+                            error = "PROFILE_PRIVATE"
+                    elif error == "NOT_A_MEMBER":
+                        logger.info("Player %s is banned (NOT_A_MEMBER)", username)
+                fallback_direct_attempt_ms = (time.time() * 1000) - fallback_started_ms
 
-        if error:
-            _stats["failed"] += 1
-            logger.warning(
-                "\033[31mFailed\033[0m %s — %s (%.0fms)",
-                username, error, fetch_time_ms,
+            fetch_time_ms = time.time() * 1000 - start_ms
+            queue_wait_ms = max(0.0, start_ms - queued_at_ms)
+            total_time_ms = max(0.0, (time.time() * 1000) - queued_at_ms)
+            _record_request_timing(
+                fetch_time_ms,
+                queue_wait_ms,
+                total_time_ms,
+                proxy_attempt_ms=proxy_attempt_ms,
+                direct_attempt_ms=direct_attempt_ms,
+                fallback_direct_attempt_ms=fallback_direct_attempt_ms,
             )
-            await result_queue.put({
-                "status": "error",
-                "task_id": task_id,
-                "username": username,
-                "error_code": error,
-                "detail": "",
-            })
-        else:
-            _stats["completed"] += 1
-            await result_queue.put({
-                "status": "success",
-                "task_id": task_id,
-                "username": username,
-                "data": data,
-                "fetch_time_ms": round(fetch_time_ms, 1),
-                "fetched_at": datetime.now(UTC).isoformat(),
-            })
-            logger.info(
-                "\033[32mFetched\033[0m %s — %.0fms (queued for batch)",
-                username, fetch_time_ms,
-            )
 
-        await asyncio.sleep(fetch_delay)
+            if error:
+                _stats["failed"] += 1
+                logger.warning(
+                    "\033[31mFailed\033[0m %s — %s (%.0fms)",
+                    username, error, fetch_time_ms,
+                )
+                await result_queue.put({
+                    "status": "error",
+                    "task_id": task_id,
+                    "username": username,
+                    "error_code": error,
+                    "detail": "",
+                })
+            else:
+                _stats["completed"] += 1
+                await result_queue.put({
+                    "status": "success",
+                    "task_id": task_id,
+                    "username": username,
+                    "data": data,
+                    "fetch_time_ms": round(fetch_time_ms, 1),
+                    "fetched_at": datetime.now(UTC).isoformat(),
+                })
+                logger.info(
+                    "\033[32mFetched\033[0m %s — %.0fms (queued for batch)",
+                    username, fetch_time_ms,
+                )
+
+            await asyncio.sleep(fetch_delay)
+        finally:
+            _state["in_flight"] = max(0, int(_state.get("in_flight", 0)) - 1)
 
 
 async def _proxy_retry_loop(
@@ -485,10 +588,14 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                 rate_limiter = RateLimiter(rate=rate_limit_per_hour)
 
                 # Send ready
-                ready_payload = {"capacity": max_concurrent}
+                ready_payload: dict[str, object] = {"capacity": max_concurrent}
                 if _proxy["urls"]:
                     ready_payload["has_proxy"] = True
                     ready_payload["proxy_count"] = len(_proxy["urls"])
+                ready_payload["capabilities"] = {
+                    "accurate_current_load": True,
+                    "request_timing_v1": True,
+                }
                 ready_msg = build_message("ready", ready_payload, worker_id, secret)
                 await ws.send(ready_msg)
                 _state["status"] = "running"
@@ -557,10 +664,14 @@ async def run(master_url: str, max_concurrent: int = 5, proxy_urls: list[str] | 
                                 fetch_delay, max_concurrent, rate_limiter._rate,
                             )
                             # Acknowledge with updated capacity
-                            ready_payload = {"capacity": max_concurrent}
+                            ready_payload: dict[str, object] = {"capacity": max_concurrent}
                             if _proxy["urls"]:
                                 ready_payload["has_proxy"] = True
                                 ready_payload["proxy_count"] = len(_proxy["urls"])
+                            ready_payload["capabilities"] = {
+                                "accurate_current_load": True,
+                                "request_timing_v1": True,
+                            }
                             ready_msg = build_message("ready", ready_payload, worker_id, secret)
                             await ws.send(ready_msg)
 

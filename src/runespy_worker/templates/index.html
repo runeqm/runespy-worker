@@ -382,6 +382,41 @@
             </div>
           </div>
 
+          <h2 class="mt-16">Request timing</h2>
+          <div class="config-grid">
+            <div class="config-item">
+              <span class="config-key">Fetch p50</span>
+              <span class="config-val" id="rt-fetch-p50">{{ stats.request_timing.fetch_ms_p50 if stats.request_timing and stats.request_timing.window else '—' }}{% if stats.request_timing and stats.request_timing.window %}ms{% endif %}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Fetch p95</span>
+              <span class="config-val" id="rt-fetch-p95">{{ stats.request_timing.fetch_ms_p95 if stats.request_timing and stats.request_timing.window else '—' }}{% if stats.request_timing and stats.request_timing.window %}ms{% endif %}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Queue p95</span>
+              <span class="config-val" id="rt-queue-p95">{{ stats.request_timing.queue_wait_ms_p95 if stats.request_timing and stats.request_timing.window else '—' }}{% if stats.request_timing and stats.request_timing.window %}ms{% endif %}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Samples</span>
+              <span class="config-val" id="rt-window">{{ stats.request_timing.window if stats.request_timing else 0 }}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Proxy p95</span>
+              <span class="config-val" id="rt-proxy-p95">{{ stats.request_timing.proxy_fetch_ms_p95 if stats.request_timing and stats.request_timing.proxy_samples else '—' }}{% if stats.request_timing and stats.request_timing.proxy_samples %}ms{% endif %}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Direct p95</span>
+              <span class="config-val" id="rt-direct-p95">{{ stats.request_timing.direct_fetch_ms_p95 if stats.request_timing and stats.request_timing.direct_samples else '—' }}{% if stats.request_timing and stats.request_timing.direct_samples %}ms{% endif %}</span>
+            </div>
+            <div class="config-item">
+              <span class="config-key">Fallback p95</span>
+              <span class="config-val" id="rt-fallback-p95">{{ stats.request_timing.fallback_direct_fetch_ms_p95 if stats.request_timing and stats.request_timing.fallback_direct_samples else '—' }}{% if stats.request_timing and stats.request_timing.fallback_direct_samples %}ms{% endif %}</span>
+            </div>
+          </div>
+          <div class="mt-8" style="height: 170px;">
+            <canvas id="timing-chart" style="width: 100%; height: 170px;"></canvas>
+          </div>
+
           <h2 class="mt-16">Server config</h2>
           <div class="config-grid">
             <div class="config-item">
@@ -466,6 +501,8 @@
     {% endif %}
   </div>
 
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
   <script>
     // Tab switching
     document.querySelectorAll('.tab').forEach(tab => {
@@ -511,6 +548,140 @@
     }
 
     let prevLogCount = 0;
+    let timingChart = null;
+
+    function buildTimingChart() {
+      const canvas = document.getElementById('timing-chart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      timingChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            {
+              label: 'Fetch p50',
+              data: [],
+              borderColor: '#4ade80',
+              backgroundColor: 'rgba(74,222,128,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+            {
+              label: 'Fetch p95',
+              data: [],
+              borderColor: '#fbbf24',
+              backgroundColor: 'rgba(251,191,36,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+            {
+              label: 'Queue p95',
+              data: [],
+              borderColor: '#6c8aff',
+              backgroundColor: 'rgba(108,138,255,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+            {
+              label: 'Proxy p95',
+              data: [],
+              borderColor: '#f472b6',
+              backgroundColor: 'rgba(244,114,182,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+            {
+              label: 'Direct p95',
+              data: [],
+              borderColor: '#34d399',
+              backgroundColor: 'rgba(52,211,153,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+            {
+              label: 'Fallback p95',
+              data: [],
+              borderColor: '#fb7185',
+              backgroundColor: 'rgba(251,113,133,0.1)',
+              borderWidth: 1.5,
+              tension: 0.25,
+              pointRadius: 0,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: 'index', intersect: false },
+          scales: {
+            x: {
+              ticks: { color: '#8b8fa3', maxTicksLimit: 8, font: { size: 10 } },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+            },
+            y: {
+              beginAtZero: true,
+              ticks: { color: '#8b8fa3', font: { size: 10 } },
+              grid: { color: 'rgba(255,255,255,0.05)' },
+            },
+          },
+          plugins: {
+            legend: {
+              labels: { color: '#8b8fa3', font: { size: 11 }, boxWidth: 12 },
+            },
+          },
+        },
+      });
+    }
+
+    function appendTimingPoint(rt) {
+      if (!timingChart || !rt || !rt.window) return;
+      const nowLabel = new Date().toLocaleTimeString();
+      timingChart.data.labels.push(nowLabel);
+      timingChart.data.datasets[0].data.push(rt.fetch_ms_p50 ?? null);
+      timingChart.data.datasets[1].data.push(rt.fetch_ms_p95 ?? null);
+      timingChart.data.datasets[2].data.push(rt.queue_wait_ms_p95 ?? null);
+      timingChart.data.datasets[3].data.push((rt.proxy_samples || 0) > 0 ? (rt.proxy_fetch_ms_p95 ?? null) : null);
+      timingChart.data.datasets[4].data.push((rt.direct_samples || 0) > 0 ? (rt.direct_fetch_ms_p95 ?? null) : null);
+      timingChart.data.datasets[5].data.push((rt.fallback_direct_samples || 0) > 0 ? (rt.fallback_direct_fetch_ms_p95 ?? null) : null);
+
+      const maxPoints = 120;
+      if (timingChart.data.labels.length > maxPoints) {
+        timingChart.data.labels.shift();
+        timingChart.data.datasets.forEach(ds => ds.data.shift());
+      }
+      timingChart.update();
+    }
+
+    function updateTimingSummary(rt) {
+      const setText = (id, val) => {
+        const node = document.getElementById(id);
+        if (node) node.textContent = val;
+      };
+      if (!rt || !rt.window) {
+        setText('rt-fetch-p50', '—');
+        setText('rt-fetch-p95', '—');
+        setText('rt-queue-p95', '—');
+        setText('rt-proxy-p95', '—');
+        setText('rt-direct-p95', '—');
+        setText('rt-fallback-p95', '—');
+        setText('rt-window', '0');
+        return;
+      }
+      setText('rt-fetch-p50', (rt.fetch_ms_p50 ?? '—') + 'ms');
+      setText('rt-fetch-p95', (rt.fetch_ms_p95 ?? '—') + 'ms');
+      setText('rt-queue-p95', (rt.queue_wait_ms_p95 ?? '—') + 'ms');
+      setText('rt-proxy-p95', (rt.proxy_samples || 0) > 0 ? ((rt.proxy_fetch_ms_p95 ?? '—') + 'ms') : '—');
+      setText('rt-direct-p95', (rt.direct_samples || 0) > 0 ? ((rt.direct_fetch_ms_p95 ?? '—') + 'ms') : '—');
+      setText('rt-fallback-p95', (rt.fallback_direct_samples || 0) > 0 ? ((rt.fallback_direct_fetch_ms_p95 ?? '—') + 'ms') : '—');
+      setText('rt-window', String(rt.window));
+    }
 
     async function refresh() {
       try {
@@ -541,6 +712,10 @@
           if (el('cfg-delay')) el('cfg-delay').textContent = (d.config.fetch_delay || '—') + 's';
           if (el('cfg-concurrent')) el('cfg-concurrent').textContent = d.config.max_concurrent || '—';
         }
+
+        // Request timing
+        updateTimingSummary(d.request_timing);
+        appendTimingPoint(d.request_timing);
 
         // Logs — append only new lines
         const viewer = document.getElementById('log-viewer');
@@ -573,6 +748,22 @@
 
     // Initialize log count from server-rendered content
     if (lv) prevLogCount = lv.querySelectorAll('.log-line').length;
+
+    buildTimingChart();
+    {% if stats and stats.request_timing and stats.request_timing.window %}
+    appendTimingPoint({
+      fetch_ms_p50: {{ stats.request_timing.fetch_ms_p50 }},
+      fetch_ms_p95: {{ stats.request_timing.fetch_ms_p95 }},
+      queue_wait_ms_p95: {{ stats.request_timing.queue_wait_ms_p95 }},
+      proxy_fetch_ms_p95: {{ stats.request_timing.proxy_fetch_ms_p95|default('null', true) }},
+      direct_fetch_ms_p95: {{ stats.request_timing.direct_fetch_ms_p95|default('null', true) }},
+      fallback_direct_fetch_ms_p95: {{ stats.request_timing.fallback_direct_fetch_ms_p95|default('null', true) }},
+      proxy_samples: {{ stats.request_timing.proxy_samples|default(0) }},
+      direct_samples: {{ stats.request_timing.direct_samples|default(0) }},
+      fallback_direct_samples: {{ stats.request_timing.fallback_direct_samples|default(0) }},
+      window: {{ stats.request_timing.window }}
+    });
+    {% endif %}
 
     setInterval(refresh, 3000);
     {% endif %}
