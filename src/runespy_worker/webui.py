@@ -5,12 +5,17 @@ files written by the worker process to display a live dashboard.
 """
 
 import json
+import re
 import socket
 import threading
+import time
 from pathlib import Path
 from subprocess import CalledProcessError, Popen, run
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from flask import Flask, redirect, render_template, request, url_for
+from runespy_worker import __version__
 
 app = Flask(__name__)
 RUNE_HOME = Path.home() / ".runespy"
@@ -19,6 +24,11 @@ MASTER_URL = "wss://runespy.com"
 # Worker subprocess handle (guarded by _proc_lock for thread safety)
 _worker_proc: Popen | None = None
 _proc_lock = threading.Lock()
+_VERSION_CACHE_TTL_SECONDS = 15 * 60
+_version_cache: dict[str, float | dict | None] = {
+    "checked_at": 0.0,
+    "result": None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +114,71 @@ def _is_running() -> bool:
         return _worker_proc.poll() is None
 
 
+def _parse_version_tuple(raw: str) -> tuple[int, ...] | None:
+    cleaned = raw.strip().lstrip("vV")
+    if not re.fullmatch(r"\d+(?:\.\d+)*", cleaned):
+        return None
+    return tuple(int(p) for p in cleaned.split("."))
+
+
+def _fetch_latest_version_tag() -> str | None:
+    urls = [
+        "https://api.github.com/repos/metalglove/runespy-worker/releases/latest",
+        "https://api.github.com/repos/metalglove/runespy-worker/tags?per_page=1",
+    ]
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "runespy-worker-webui",
+    }
+
+    for url in urls:
+        req = Request(url, headers=headers)
+        try:
+            with urlopen(req, timeout=3) as resp:  # noqa: S310
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (OSError, ValueError, URLError):
+            continue
+
+        if isinstance(payload, dict) and payload.get("tag_name"):
+            return str(payload["tag_name"]).strip()
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict) and payload[0].get("name"):
+            return str(payload[0]["name"]).strip()
+
+    return None
+
+
+def _get_version_status() -> dict[str, str | None]:
+    now = time.time()
+    cached_result = _version_cache.get("result")
+    checked_at = float(_version_cache.get("checked_at", 0.0) or 0.0)
+    if isinstance(cached_result, dict) and (now - checked_at) < _VERSION_CACHE_TTL_SECONDS:
+        return cached_result
+
+    current = __version__
+    latest = _fetch_latest_version_tag()
+    result: dict[str, str | None] = {
+        "current": current,
+        "latest": latest,
+        "status": "unknown",
+    }
+
+    if latest:
+        current_tuple = _parse_version_tuple(current)
+        latest_tuple = _parse_version_tuple(latest)
+        if current_tuple and latest_tuple:
+            result["status"] = "up_to_date" if current_tuple >= latest_tuple else "update_available"
+        else:
+            result["status"] = (
+                "up_to_date"
+                if current.strip().lstrip("vV") == latest.strip().lstrip("vV")
+                else "update_available"
+            )
+
+    _version_cache["checked_at"] = now
+    _version_cache["result"] = result
+    return result
+
+
 def _build_worker_cmd() -> list[str]:
     cmd = ["uv", "run", "runespy-worker", "run", "--master", MASTER_URL]
     webshare_key, proxy_url = _read_proxy_config()
@@ -153,6 +228,7 @@ def index():
     stats = _read_stats()
     logs = _read_logs()
     timing_history = _read_timing_history()
+    version_status = _get_version_status()
     webshare_api_key, proxy_url = _read_proxy_config()
 
     worker_status = None
@@ -177,6 +253,7 @@ def index():
         stats=stats,
         logs=logs,
         timing_history=timing_history,
+        version_status=version_status,
         uptime_display=uptime_display,
         webshare_api_key=webshare_api_key,
         proxy_url=proxy_url,

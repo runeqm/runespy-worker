@@ -339,6 +339,16 @@
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <div>
               <p class="info">Worker <code>{{ worker_id }}</code>{% if worker_name %} ({{ worker_name }}){% endif %}</p>
+              <p class="info mt-8">
+                Version:
+                {% if version_status.status == 'up_to_date' %}
+                  <span style="color: var(--green);">v{{ version_status.current }} (latest)</span>
+                {% elif version_status.status == 'update_available' %}
+                  <span style="color: var(--yellow);">v{{ version_status.current }} (latest {{ version_status.latest }})</span>
+                {% else %}
+                  <span style="color: var(--text-dim);">v{{ version_status.current }} (latest check unavailable)</span>
+                {% endif %}
+              </p>
             </div>
             <div class="btn-group">
               {% if is_running %}
@@ -494,6 +504,24 @@
               <span class="config-key">Secret</span>
               <span class="config-val" style="color: var(--green);">saved</span>
             </div>
+            <div class="config-item">
+              <span class="config-key">Version</span>
+              <span class="config-val">
+                {% if version_status.status == 'up_to_date' %}
+                  <span style="color: var(--green);">v{{ version_status.current }} (latest)</span>
+                {% elif version_status.status == 'update_available' %}
+                  <span style="color: var(--yellow);">v{{ version_status.current }} (update available)</span>
+                {% else %}
+                  <span style="color: var(--text-dim);">v{{ version_status.current }} (check unavailable)</span>
+                {% endif %}
+              </span>
+            </div>
+            {% if version_status.latest and version_status.latest|replace('v', '') != version_status.current|replace('v', '') %}
+            <div class="config-item">
+              <span class="config-key">Latest</span>
+              <span class="config-val">{{ version_status.latest }}</span>
+            </div>
+            {% endif %}
           </div>
         </div>
       </div>
