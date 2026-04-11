@@ -14,7 +14,8 @@ from subprocess import CalledProcessError, Popen, run
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from flask import Flask, redirect, render_template, request, url_for
+import httpx
+from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 app = Flask(__name__)
 RUNE_HOME = Path.home() / ".runespy"
@@ -28,6 +29,10 @@ _commit_cache: dict[str, float | dict | None] = {
     "checked_at": 0.0,
     "result": None,
 }
+_webshare_stats_cache: dict | None = None
+_webshare_stats_cache_time: float = 0.0
+_WEBSHARE_STATS_TTL = 60.0
+_webshare_stats_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +109,92 @@ def _format_uptime(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     return f"{h}h {m}m"
+
+
+def _format_bytes(num: int | float | None) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num or 0)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "0 B"
+
+
+def _fetch_webshare_json(path: str) -> dict | None:
+    webshare_api_key, _ = _read_proxy_config()
+    if not webshare_api_key:
+        return None
+
+    try:
+        res = httpx.get(
+            f"https://proxy.webshare.io/api/v2/{path}",
+            headers={"Authorization": f"Token {webshare_api_key}"},
+            timeout=10,
+        )
+        res.raise_for_status()
+        return res.json()
+    except Exception:
+        app.logger.exception("Failed Webshare request for %s", path)
+        return None
+
+
+def _fetch_webshare_stats() -> dict | None:
+    global _webshare_stats_cache, _webshare_stats_cache_time
+
+    now = time.monotonic()
+    with _webshare_stats_lock:
+        if _webshare_stats_cache is not None and now - _webshare_stats_cache_time < _WEBSHARE_STATS_TTL:
+            return _webshare_stats_cache
+
+    webshare_api_key, _ = _read_proxy_config()
+    if not webshare_api_key:
+        return None
+
+    aggregate = _fetch_webshare_json("stats/aggregate/")
+    if not aggregate:
+        return None
+
+    bandwidth_total = aggregate.get("bandwidth_total", 0)
+    bandwidth_projected = aggregate.get("bandwidth_projected", 0)
+
+    bandwidth_limit_gb = None
+    bandwidth_limit_human = "-"
+
+    subscription = _fetch_webshare_json("subscription/")
+    if subscription:
+        plan_info = subscription.get("plan")
+        plan_id = None
+        if isinstance(plan_info, dict):
+            plan_id = plan_info.get("id")
+        elif isinstance(plan_info, int):
+            plan_id = plan_info
+        else:
+            plan_id = subscription.get("plan_id")
+
+        if plan_id:
+            plan = _fetch_webshare_json(f"subscription/plan/{plan_id}/")
+            if plan:
+                bandwidth_limit_gb = plan.get("bandwidth_limit")
+                if bandwidth_limit_gb == 0:
+                    bandwidth_limit_human = "Unlimited"
+                elif bandwidth_limit_gb is not None:
+                    bandwidth_limit_human = f"{bandwidth_limit_gb:g} GB"
+
+    result = {
+        "bandwidth_total": bandwidth_total,
+        "bandwidth_projected": bandwidth_projected,
+        "bandwidth_total_human": _format_bytes(bandwidth_total),
+        "bandwidth_projected_human": _format_bytes(bandwidth_projected),
+        "bandwidth_limit_gb": bandwidth_limit_gb,
+        "bandwidth_limit_human": bandwidth_limit_human,
+    }
+    with _webshare_stats_lock:
+        _webshare_stats_cache = result
+        _webshare_stats_cache_time = now
+    return result
 
 
 def _is_running() -> bool:
@@ -235,6 +326,7 @@ def index():
     timing_history = _read_timing_history()
     commit_status = _get_commit_status()
     webshare_api_key, proxy_url = _read_proxy_config()
+    proxy_stats = _fetch_webshare_stats()
 
     worker_status = None
     uptime_display = "0s"
@@ -263,6 +355,7 @@ def index():
         webshare_api_key=webshare_api_key,
         proxy_url=proxy_url,
         proxy_count=proxy_count,
+        proxy_stats=proxy_stats,
         flash_error=flash_error,
         flash_success=flash_success,
     )
@@ -354,10 +447,39 @@ def stop_worker():
 
 @app.route("/api/stats")
 def api_stats():
-    stats = _read_stats() or {}
-    stats["logs"] = _read_logs()
-    stats["is_running"] = _is_running()
-    return stats
+    raw = _read_stats() or {}
+    nested_stats = raw.get("stats", {})
+    config = raw.get("config", {})
+
+    response = {
+        "status": raw.get("status"),
+        "uptime": raw.get("uptime", 0),
+        "proxy_count": raw.get("proxy_count", 0),
+        "request_timing": raw.get("request_timing"),
+        "stats": {
+            "completed": nested_stats.get("completed", 0),
+            "failed": nested_stats.get("failed", 0),
+            "batches_received": nested_stats.get("batches_received", 0),
+            "batches_sent": nested_stats.get("batches_sent", 0),
+        },
+        "config": {
+            "rate_limit_per_hour": config.get("rate_limit_per_hour"),
+            "fetch_delay": config.get("fetch_delay"),
+            "max_concurrent": config.get("max_concurrent"),
+        },
+        "logs": _read_logs(),
+        "is_running": _is_running(),
+    }
+
+    proxy_stats = _fetch_webshare_stats()
+    if proxy_stats:
+        response["proxyStats"] = {
+            "bandwidthTotalHuman": proxy_stats["bandwidth_total_human"],
+            "bandwidthProjectedHuman": proxy_stats["bandwidth_projected_human"],
+            "bandwidthLimitHuman": proxy_stats["bandwidth_limit_human"],
+        }
+
+    return jsonify(response)
 
 
 # ---------------------------------------------------------------------------
